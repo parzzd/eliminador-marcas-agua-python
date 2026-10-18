@@ -8,6 +8,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -37,6 +38,7 @@ class ImageCanvas(tk.Canvas):
         self.pan_cursor = ""
         self.window_system = self.tk.call("tk", "windowingsystem")
         self.bind("<Configure>", lambda _event: self.redraw())
+        self.bind("<Enter>", lambda _event: self.focus_set())
         self.bind("<MouseWheel>", self._wheel)
         self.bind("<Button-4>", self._wheel)
         self.bind("<Button-5>", self._wheel)
@@ -208,6 +210,9 @@ class Application(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Control-o>", lambda _event: self.open_file())
         self.bind("<Control-0>", lambda _event: self.original.fit())
+        # Windows puede entregar la rueda al control que conserva el foco,
+        # aunque el puntero esté encima de la imagen.
+        self.bind("<MouseWheel>", self._wheel_at_pointer)
         self.after(80, self._poll)
 
     def _style(self) -> None:
@@ -415,6 +420,16 @@ class Application(tk.Tk):
         other.zoom_target = source.viewport.zoom
         other.redraw()
         self.zoom_status.set(f"Zoom ×{source.viewport.zoom:.2f}")
+
+    def _wheel_at_pointer(self, event) -> str | None:
+        hovered = self.winfo_containing(event.x_root, event.y_root)
+        if hovered in (self.original, self.result):
+            return hovered._wheel(SimpleNamespace(
+                x=event.x_root - hovered.winfo_rootx(),
+                y=event.y_root - hovered.winfo_rooty(),
+                delta=event.delta,
+            ))
+        return None
 
     def _show_zone(self) -> None:
         if self.roi is None:

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 import tempfile
 import time
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -88,6 +89,17 @@ try:
         assert abs(app.result.viewport.zoom - canvas.viewport.zoom) < 1e-6
         canvas.event_generate("<MouseWheel>", x=center[0], y=center[1], delta=15)
         assert abs(canvas.zoom_target - 1.08 ** 1.125) < 1e-8, "Conservar desplazamientos pequeños de rueda"
+        pump(app, 0.7)
+
+        # La rueda debe funcionar sobre la imagen aunque otro control tenga
+        # el foco del teclado (ruta habitual de MouseWheel en Windows).
+        previous_target = canvas.zoom_target
+        # Solo simula qué widget hay bajo el puntero: el escritorio de pruebas
+        # puede estar oculto por otra ventana o ejecutarse sin pantalla física.
+        with patch.object(app, "winfo_containing", return_value=canvas):
+            app.event_generate("<MouseWheel>", delta=120,
+                rootx=canvas.winfo_rootx() + center[0], rooty=canvas.winfo_rooty() + center[1])
+        assert abs(canvas.zoom_target - previous_target * 1.08) < 1e-8
         pump(app, 0.7)
 
         # Precisión del cuentagotas tras ampliar y desplazar; la vista previa
