@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from .core import ColorTarget, ProcessingCancelled, Settings, mask_overlay, process_frame
 from .media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, export_image, export_video, read_image, read_video_frame, video_info
+from .viewport import Viewport
 
 BG, PANEL, FIELD = "#10151E", "#19212D", "#222D3C"
 TEXT, MUTED, ACCENT = "#EAF0F8", "#9BAABE", "#60E0BC"
@@ -24,48 +25,142 @@ class ImageCanvas(tk.Canvas):
     def __init__(self, parent: tk.Widget, **kwargs: object) -> None:
         super().__init__(parent, bg="#0B1018", highlightthickness=0, **kwargs)
         self.array: np.ndarray | None = None
+        self.pil_image: Image.Image | None = None
         self.photo: ImageTk.PhotoImage | None = None
         self.roi: tuple[int, int, int, int] | None = None
-        self.scale_factor = 1.0
-        self.offset = (0, 0)
+        self.viewport = Viewport()
+        self.on_view_change = None
+        self.zoom_target = 1.0
+        self.zoom_anchor = (0, 0)
+        self.zoom_timer: str | None = None
+        self.pan_start: tuple[int, int] | None = None
+        self.pan_cursor = ""
+        self.window_system = self.tk.call("tk", "windowingsystem")
         self.bind("<Configure>", lambda _event: self.redraw())
+        self.bind("<MouseWheel>", self._wheel)
+        self.bind("<Button-4>", self._wheel)
+        self.bind("<Button-5>", self._wheel)
+        for button in (2, 3):
+            self.bind(f"<ButtonPress-{button}>", self._pan_press)
+            self.bind(f"<B{button}-Motion>", self._pan_move)
+            self.bind(f"<ButtonRelease-{button}>", self._pan_release)
 
-    def show(self, array: np.ndarray | None, roi: tuple[int, int, int, int] | None = None) -> None:
+    @property
+    def scale_factor(self) -> float:
+        return self.viewport.scale
+
+    @property
+    def offset(self) -> tuple[float, float]:
+        return self.viewport.offset
+
+    def show(self, array: np.ndarray | None, roi: tuple[int, int, int, int] | None = None, reset_view: bool = False) -> None:
         self.array, self.roi = array, roi
+        self.pil_image = Image.fromarray(array) if array is not None else None
+        if array is not None:
+            height, width = array.shape[:2]
+            if reset_view or (width, height) != (self.viewport.image_width, self.viewport.image_height):
+                self.stop_zoom()
+                self.viewport.set_image(width, height, reset=True)
+                self.zoom_target = 1.0
         self.redraw()
 
     def redraw(self) -> None:
         self.delete("all")
         width, height = max(1, self.winfo_width()), max(1, self.winfo_height())
+        self.viewport.resize(width, height)
         if self.array is None:
             self.create_text(width // 2, height // 2 - 18, text="+", font=("Segoe UI", 34), fill=ACCENT)
             self.create_text(width // 2, height // 2 + 27, text="Abre una imagen o un video", font=("Segoe UI", 12), fill=MUTED)
             return
-        h, w = self.array.shape[:2]
-        self.scale_factor = min(width / w, height / h)
-        size = (max(1, int(w * self.scale_factor)), max(1, int(h * self.scale_factor)))
-        left, top = (width - size[0]) // 2, (height - size[1]) // 2
-        self.offset = (left, top)
-        self.photo = ImageTk.PhotoImage(Image.fromarray(self.array).resize(size, Image.Resampling.LANCZOS))
-        self.create_image(left, top, image=self.photo, anchor="nw")
+        left, top = self.offset
+        # Dibuja solo el área visible: ampliar a 32x no crea una imagen gigante.
+        inverse = 1 / self.scale_factor
+        visible = self.pil_image.transform((width, height), Image.Transform.AFFINE,
+            (inverse, 0, -left * inverse, 0, inverse, -top * inverse),
+            resample=Image.Resampling.BICUBIC, fillcolor="#0B1018")
+        self.photo = ImageTk.PhotoImage(visible)
+        self.create_image(0, 0, image=self.photo, anchor="nw")
+        self.draw_roi()
+
+    def draw_roi(self) -> None:
+        self.delete("selection")
         if self.roi:
             x0, y0, x1, y1 = self.roi
-            self.create_rectangle(left + x0 * self.scale_factor, top + y0 * self.scale_factor,
-                                  left + x1 * self.scale_factor, top + y1 * self.scale_factor,
-                                  outline=ACCENT, width=2, dash=(6, 3))
+            left, top = self.viewport.canvas_point(x0, y0)
+            right, bottom = self.viewport.canvas_point(x1, y1)
+            self.create_rectangle(left, top, right, bottom, outline="#07110E", width=4, tags="selection")
+            self.create_rectangle(left, top, right, bottom, outline=ACCENT, width=2, dash=(6, 3), tags="selection")
+            for x, y in ((left, top), (right, top), (left, bottom), (right, bottom)):
+                self.create_rectangle(x - 3, y - 3, x + 3, y + 3, fill=ACCENT, outline="#07110E", tags="selection")
 
     def image_point(self, x: int, y: int, clamp: bool = False) -> tuple[int, int] | None:
         if self.array is None:
             return None
-        height, width = self.array.shape[:2]
-        px = int((x - self.offset[0]) / self.scale_factor)
-        py = int((y - self.offset[1]) / self.scale_factor)
-        if clamp:
-            return max(0, min(width - 1, px)), max(0, min(height - 1, py))
-        # Verifica coordenadas flotantes: int(-0.5) también da 0.
-        if x < self.offset[0] or y < self.offset[1] or not (0 <= px < width and 0 <= py < height):
-            return None
-        return px, py
+        return self.viewport.image_point(x, y, clamp)
+
+    def stop_zoom(self) -> None:
+        if self.zoom_timer is not None:
+            self.after_cancel(self.zoom_timer)
+            self.zoom_timer = None
+        self.zoom_target = self.viewport.zoom
+
+    def _notify_view(self) -> None:
+        if self.on_view_change is not None:
+            self.on_view_change(self)
+
+    def _wheel(self, event) -> str:
+        if self.array is None:
+            return "break"
+        number = getattr(event, "num", None)
+        if number in (4, 5):
+            steps = 1 if number == 4 else -1
+        else:
+            delta = getattr(event, "delta", 0)
+            steps = delta if self.window_system == "aqua" else delta / 120
+        steps = max(-4, min(4, steps))
+        self.zoom_target = max(1.0, min(32.0, self.zoom_target * 1.08**steps))
+        self.zoom_anchor = (event.x, event.y)
+        if self.zoom_timer is None:
+            self.zoom_timer = self.after(16, self._animate_zoom)
+        return "break"
+
+    def _animate_zoom(self) -> None:
+        self.zoom_timer = None
+        difference = self.zoom_target - self.viewport.zoom
+        finished = abs(difference) < self.zoom_target * 0.0005
+        zoom = self.zoom_target if finished else self.viewport.zoom + difference * 0.3
+        self.viewport.zoom_at(zoom, *self.zoom_anchor)
+        self.redraw()
+        self._notify_view()
+        if not finished:
+            self.zoom_timer = self.after(16, self._animate_zoom)
+
+    def fit(self) -> None:
+        self.stop_zoom()
+        self.viewport.fit()
+        self.zoom_target = 1.0
+        self.redraw()
+        self._notify_view()
+
+    def _pan_press(self, event) -> str:
+        self.stop_zoom()
+        self.pan_start = (event.x, event.y)
+        self.pan_cursor = self.cget("cursor")
+        self.configure(cursor="fleur")
+        return "break"
+
+    def _pan_move(self, event) -> str:
+        if self.pan_start is not None:
+            self.viewport.pan(event.x - self.pan_start[0], event.y - self.pan_start[1])
+            self.pan_start = (event.x, event.y)
+            self.redraw()
+            self._notify_view()
+        return "break"
+
+    def _pan_release(self, _event) -> str:
+        self.pan_start = None
+        self.configure(cursor=self.pan_cursor)
+        return "break"
 
 
 class Application(tk.Tk):
@@ -82,6 +177,7 @@ class Application(tk.Tk):
         self.colors: list[ColorTarget] = []
         self.roi: tuple[int, int, int, int] | None = None
         self.drag_start: tuple[int, int] | None = None
+        self.drag_canvas: ImageCanvas | None = None
         self.preview_result: np.ndarray | None = None
         self.preview_mask: np.ndarray | None = None
         self.messages: queue.Queue = queue.Queue()
@@ -104,10 +200,14 @@ class Application(tk.Tk):
         self.mask_status = tk.StringVar(value="Sin máscara")
         self.file_status = tk.StringVar(value="Ningún archivo abierto")
         self.position = tk.StringVar(value="IMAGEN FIJA")
+        self.zoom_status = tk.StringVar(value="Zoom ×1.00")
+        self.zone_status = tk.StringVar(value="Zona: imagen completa")
+        self.tool_hint = tk.StringVar(value="Cuentagotas: haz clic en el original. Rueda: zoom suave. Arrastre derecho: mover.")
         self._style()
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Control-o>", lambda _event: self.open_file())
+        self.bind("<Control-0>", lambda _event: self.original.fit())
         self.after(80, self._poll)
 
     def _style(self) -> None:
@@ -195,9 +295,18 @@ class Application(tk.Tk):
                   font=("Segoe UI", 10)).pack(anchor="w", pady=(7, 13))
         tools = ttk.Frame(content)
         tools.pack(fill="x", pady=(0, 10))
-        ttk.Radiobutton(tools, text="Cuentagotas", variable=self.mode, value="pick", command=self._cursor).pack(side="left")
-        ttk.Radiobutton(tools, text="Delimitar zona", variable=self.mode, value="roi", command=self._cursor).pack(side="left", padx=8)
+        self.pick_button = ttk.Radiobutton(tools, text="Cuentagotas", variable=self.mode, value="pick", command=self._cursor)
+        self.pick_button.pack(side="left")
+        self.roi_button = ttk.Radiobutton(tools, text="Delimitar zona", variable=self.mode, value="roi", command=self._cursor)
+        self.roi_button.pack(side="left", padx=8)
         ttk.Button(tools, text="Quitar zona", command=self._clear_roi).pack(side="right")
+        navigation = ttk.Frame(content)
+        navigation.pack(fill="x", pady=(0, 6))
+        ttk.Label(navigation, textvariable=self.zone_status, background=BG, foreground=ACCENT).pack(side="left")
+        ttk.Button(navigation, text="Ajustar imagen", command=lambda: self.original.fit()).pack(side="right")
+        ttk.Label(navigation, textvariable=self.zoom_status, background=BG, foreground=MUTED).pack(side="right", padx=12)
+        ttk.Label(content, textvariable=self.tool_hint, background=BG, foreground=MUTED,
+                  font=("Segoe UI", 9), wraplength=670).pack(anchor="w", pady=(0, 10))
         views = ttk.Frame(content)
         views.pack(fill="both", expand=True)
         views.columnconfigure((0, 1), weight=1, uniform="view")
@@ -208,9 +317,11 @@ class Application(tk.Tk):
         self.result = ImageCanvas(views, width=1, height=1)
         self.original.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
         self.result.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
-        self.original.bind("<ButtonPress-1>", self._press)
-        self.original.bind("<B1-Motion>", self._drag)
-        self.original.bind("<ButtonRelease-1>", self._release)
+        for canvas in (self.original, self.result):
+            canvas.on_view_change = self._sync_view
+            canvas.bind("<ButtonPress-1>", self._press)
+            canvas.bind("<B1-Motion>", self._drag)
+            canvas.bind("<ButtonRelease-1>", self._release)
         timeline = ttk.Frame(content)
         timeline.pack(fill="x", pady=(15, 0))
         ttk.Label(timeline, textvariable=self.position, background=BG, foreground=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
@@ -267,11 +378,16 @@ class Application(tk.Tk):
         self.source, self.source_image, self.is_video = path, image, is_video
         self.fps, self.frame_count, self.frame_index = fps, count, 0
         self.roi = None
+        self.drag_start, self.drag_canvas = None, None
+        self.mode.set("pick")
+        self._cursor()
         self.colors.clear()
         self._refresh_colors()
         self.preview_result, self.preview_mask = None, None
-        self.original.show(image)
-        self.result.show(image)
+        self.original.show(image, reset_view=True)
+        self.result.show(image, reset_view=True)
+        self.zoom_status.set("Zoom ×1.00")
+        self._show_zone()
         self.file_status.set(info)
         self.seek.configure(to=max(1, count - 1), state="normal" if is_video and count > 1 else "disabled")
         self.seek.set(0)
@@ -283,43 +399,82 @@ class Application(tk.Tk):
 
     def _cursor(self) -> None:
         self.original.configure(cursor="crosshair" if self.mode.get() == "pick" else "tcross")
+        self.result.configure(cursor="" if self.mode.get() == "pick" else "tcross")
+        self.tool_hint.set(
+            "Cuentagotas: haz clic en el original. Rueda: zoom suave. Arrastre derecho: mover."
+            if self.mode.get() == "pick" else
+            "Arrastra con el botón izquierdo en cualquiera de las vistas. La zona limita los colores elegidos."
+        )
+
+    def _sync_view(self, source: ImageCanvas) -> None:
+        other = self.result if source is self.original else self.original
+        other.stop_zoom()
+        other.viewport.zoom = source.viewport.zoom
+        other.viewport.center_x = source.viewport.center_x
+        other.viewport.center_y = source.viewport.center_y
+        other.zoom_target = source.viewport.zoom
+        other.redraw()
+        self.zoom_status.set(f"Zoom ×{source.viewport.zoom:.2f}")
+
+    def _show_zone(self) -> None:
+        if self.roi is None:
+            self.zone_status.set("Zona: imagen completa")
+        else:
+            x0, y0, x1, y1 = self.roi
+            self.zone_status.set(f"Zona: {x1 - x0} × {y1 - y0} px · ({x0}, {y0})")
+        for canvas in (self.original, self.result):
+            canvas.roi = self.roi
+            canvas.draw_roi()
 
     def _press(self, event) -> None:
         if self.exporting:
             return
-        point = self.original.image_point(event.x, event.y)
+        canvas = event.widget
+        if self.mode.get() == "pick" and canvas is not self.original:
+            return
+        # El margen de ajuste también puede iniciar un rectángulo; se limita
+        # a los bordes reales de la imagen, usando la misma transformación del zoom.
+        self.original.stop_zoom()
+        self.result.stop_zoom()
+        point = canvas.image_point(event.x, event.y, clamp=self.mode.get() == "roi")
         if point is None or self.source_image is None:
             return
         if self.mode.get() == "pick":
             x, y = point
             self._add_color(tuple(int(c) for c in self.source_image[y, x]))
         else:
+            self._invalidate_preview()
             self.drag_start = point
+            self.drag_canvas = canvas
+            canvas.grab_set()
+            self.roi = (point[0], point[1], point[0] + 1, point[1] + 1)
+            self._show_zone()
 
     def _drag(self, event) -> None:
-        if self.drag_start is None:
+        if self.drag_start is None or self.drag_canvas is None:
             return
-        point = self.original.image_point(event.x, event.y, clamp=True)
+        point = self.drag_canvas.image_point(event.x, event.y, clamp=True)
         if point is None:
             return
         x0, y0 = self.drag_start
         x1, y1 = point
-        self.original.roi = (min(x0, x1), min(y0, y1), max(x0, x1) + 1, max(y0, y1) + 1)
-        self.original.redraw()
+        self.roi = (min(x0, x1), min(y0, y1), max(x0, x1) + 1, max(y0, y1) + 1)
+        self._show_zone()
 
     def _release(self, event) -> None:
         if self.drag_start is not None:
             self._drag(event)
-            self.roi = self.original.roi
+            if self.drag_canvas is not None and self.drag_canvas.grab_current() is self.drag_canvas:
+                self.drag_canvas.grab_release()
             self.drag_start = None
+            self.drag_canvas = None
             self.request_preview()
 
     def _clear_roi(self) -> None:
         if self.exporting:
             return
         self.roi = None
-        self.original.roi = None
-        self.original.redraw()
+        self._show_zone()
         self.request_preview()
 
     def _manual_color(self) -> None:
@@ -398,17 +553,21 @@ class Application(tk.Tk):
     def request_preview(self) -> None:
         if self.source is None or self.exporting or self.closing:
             return
+        self._invalidate_preview()
+        self.preview_timer = self.after(200, self._start_preview)
+
+    def _invalidate_preview(self) -> None:
         self.generation += 1
         self.preview_valid = False
         self.export_button.configure(state="disabled")
         self.cancel_preview.set()
         if self.preview_timer:
             self.after_cancel(self.preview_timer)
-        self.preview_timer = self.after(200, self._start_preview)
+            self.preview_timer = None
 
     def _start_preview(self) -> None:
         self.preview_timer = None
-        if self.preview_busy or self.source is None or self.exporting or self.closing:
+        if self.preview_busy or self.drag_start is not None or self.source is None or self.exporting or self.closing:
             return
         try:
             settings = self.settings()
@@ -435,9 +594,9 @@ class Application(tk.Tk):
         if self.source_image is None:
             return
         if self.show_mask.get() and self.preview_mask is not None:
-            self.result.show(mask_overlay(self.source_image, self.preview_mask))
+            self.result.show(mask_overlay(self.source_image, self.preview_mask), self.roi)
         else:
-            self.result.show(self.preview_result if self.preview_result is not None else self.source_image)
+            self.result.show(self.preview_result if self.preview_result is not None else self.source_image, self.roi)
 
     def export(self) -> None:
         if self.source is None or self.exporting or not self.preview_valid:
@@ -578,6 +737,7 @@ class Application(tk.Tk):
         image.save(path)
         self.load(path)
         self.roi = (590, 540, 840, 665)
+        self._show_zone()
         self.colors = [ColorTarget((255, 255, 255), 12), ColorTarget((255, 80, 176), 12)]
         self._refresh_colors(0)
         self.request_preview()

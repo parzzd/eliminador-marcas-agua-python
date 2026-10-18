@@ -30,12 +30,14 @@ En Debian/Ubuntu, si falta Tkinter, instala `python3-tk` con el gestor de paquet
 ## Uso
 
 1. Pulsa **Abrir archivo** para cargar una imagen o un video. **Probar ejemplo** genera una imagen de prueba propia con dos colores ya seleccionados.
-2. Usa **Cuentagotas** y haz clic en los colores de la marca en la imagen original. Puedes añadir varios colores, introducirlos manualmente o quitar los que no necesites.
+2. Usa **Cuentagotas** y haz clic en los colores de la marca en la imagen original. Puedes añadir varios colores, introducirlos manualmente o quitar los que no necesites. La **rueda del ratón** amplía y reduce suavemente alrededor del cursor, en pasos de 8% por muesca; los desplazamientos pequeños de rueda también se respetan. Original y resultado mantienen el mismo zoom.
 3. Selecciona un color de la lista y ajusta su **tolerancia**. Es una distancia RGB: 0 busca el color exacto; valores mayores incluyen variaciones por sombras o compresión. Confirma los valores escritos con Enter o al salir del campo.
-4. Selecciona **Delimitar zona** y arrastra sobre el original para restringir la limpieza. La selección se mantiene en la misma posición en todos los fotogramas. **Quitar zona** vuelve a usar toda la imagen.
+4. Selecciona **Delimitar zona** y arrastra con el botón izquierdo sobre **cualquiera de las dos vistas** para restringir la limpieza. El rectángulo verde y sus dimensiones confirman la selección. Puedes arrastrar en cualquier dirección, empezar en el margen o seleccionar con zoom. La zona limita los colores elegidos; añade colores con el cuentagotas para generar la máscara. La selección se mantiene en la misma posición en todos los fotogramas. **Quitar zona** vuelve a usar toda la imagen.
 5. Elige el método, el radio de vecinos y la expansión. **Ver máscara en rosa** muestra exactamente qué píxeles se van a modificar.
 6. En videos, desplaza la barra para revisar otros fotogramas. La máscara se vuelve a calcular en **cada fotograma** a partir de los colores elegidos.
 7. Pulsa **Exportar resultado**, elige un archivo diferente del original y espera a que termine. Puedes cancelar; la salida se publica únicamente al completar y verificar el proceso. Si eliges un destino existente, el diálogo del sistema permite confirmar su reemplazo.
+
+**Arrastra con el botón derecho o central** para mover la imagen ampliada. **Ajustar imagen** o `Ctrl+0` restaura el encuadre completo. El indicador de zoom usa como referencia el encuadre ajustado a la ventana (×1.00); el zoom no cambia el tamaño del archivo exportado y se conserva al actualizar la vista previa o cambiar de fotograma.
 
 `Ctrl+O` abre un archivo. El editor mantiene la interfaz activa durante las vistas previas y exportaciones.
 
@@ -67,15 +69,16 @@ La máscara combina los colores mediante una unión de coincidencias por distanc
 .venv\Scripts\python.exe tests/smoke_gui.py
 ```
 
-La prueba de interfaz requiere un escritorio disponible. Las pruebas de procesamiento cubren selección multicolor, tolerancia, zona y expansión, moda local, máximo RGB, Telea, píxeles fuera de la máscara, orientación, transparencia, rutas Unicode, video con marca móvil, audio, dimensiones impares y cancelación con conservación del destino existente.
+La prueba de interfaz requiere un escritorio disponible. Comprueba eventos de rueda, cuentagotas ampliado, desplazamiento, sincronización entre vistas y selección desde ambas vistas, con zoom, desde el margen y mientras termina una vista previa anterior; también verifica que la exportación respete esa zona. Las pruebas de procesamiento y coordenadas cubren selección multicolor, tolerancia, zona y expansión, moda local, máximo RGB, Telea, píxeles fuera de la máscara, orientación, transparencia, rutas Unicode, video con marca móvil, audio, dimensiones impares, cancelación con conservación del destino existente y precisión de coordenadas con zoom.
 
-GitHub Actions ejecuta las pruebas de procesamiento en Windows y Linux, con Python 3.10 y 3.12.
+GitHub Actions ejecuta las pruebas de procesamiento y coordenadas en Windows y Linux, con Python 3.10 y 3.12, y las pruebas de interacción gráfica en Windows.
 
 ```text
 app.py                 Entrada de la aplicación
 limpiacolor/core.py     Detección de colores y relleno
 limpiacolor/media.py    Lectura y exportación de imágenes/videos
 limpiacolor/gui.py      Interfaz Tkinter y trabajos en segundo plano
+limpiacolor/viewport.py Coordenadas de zoom, desplazamiento y selección
 tests/                 Pruebas unitarias, integración y arranque de interfaz
 ```
 
